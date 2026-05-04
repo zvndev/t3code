@@ -75,6 +75,11 @@ const AUTO_UPDATE_STARTUP_DELAY_MS = 15_000;
 const AUTO_UPDATE_POLL_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const DESKTOP_UPDATE_CHANNEL = "latest";
 const DESKTOP_UPDATE_ALLOW_PRERELEASE = false;
+const DESKTOP_SERVER_HOST = process.env.T3CODE_DESKTOP_SERVER_HOST?.trim() || "127.0.0.1";
+const DESKTOP_SERVER_PORT_OVERRIDE = process.env.T3CODE_DESKTOP_SERVER_PORT?.trim() || "";
+const DESKTOP_SERVER_AUTH_TOKEN_OVERRIDE =
+  process.env.T3CODE_DESKTOP_SERVER_AUTH_TOKEN?.trim() || "";
+const DESKTOP_REMOTE_PASSWORD_OVERRIDE = process.env.T3CODE_DESKTOP_REMOTE_PASSWORD?.trim() || "";
 
 type DesktopUpdateErrorContext = DesktopUpdateState["errorContext"];
 
@@ -133,6 +138,69 @@ function formatErrorMessage(error: unknown): string {
   return String(error);
 }
 
+function isBrokenPipeError(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const nodeError = error as NodeJS.ErrnoException;
+  const code = typeof nodeError.code === "string" ? nodeError.code : "";
+  const message =
+    typeof nodeError.message === "string" ? nodeError.message : String(nodeError.message ?? "");
+  return code === "EPIPE" || message.includes("EPIPE");
+}
+
+function safeConsoleError(message: string, ...args: unknown[]): void {
+  try {
+    console.error(message, ...args);
+  } catch (error) {
+    if (isBrokenPipeError(error)) {
+      // stderr can be unavailable in detached/closed-terminal desktop launches.
+      // Falling back to file sink avoids crashing restart flows on log write.
+      writeDesktopLogHeader(`stderr unavailable (EPIPE) while logging: ${message}`);
+      return;
+    }
+    // Logging should never crash desktop main process.
+    writeDesktopLogHeader(`console.error failed while logging: ${message}`);
+  }
+}
+
+const CONSOLE_METHODS = ["debug", "info", "log", "warn", "error"] as const;
+let consoleWriteGuardsInstalled = false;
+
+function formatConsoleArg(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value instanceof Error) {
+    return `${value.name}: ${value.message}`;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function installSafeConsoleWriteGuards(): void {
+  if (consoleWriteGuardsInstalled) return;
+  consoleWriteGuardsInstalled = true;
+
+  for (const method of CONSOLE_METHODS) {
+    const original = console[method].bind(console) as (...args: unknown[]) => void;
+    console[method] = ((...args: unknown[]) => {
+      try {
+        original(...args);
+      } catch (error) {
+        const rendered = sanitizeLogValue(args.map(formatConsoleArg).join(" "));
+        if (isBrokenPipeError(error)) {
+          writeDesktopLogHeader(`console.${method} dropped due EPIPE: ${rendered}`);
+          return;
+        }
+        // Never crash from logging failures in desktop main.
+        writeDesktopLogHeader(`console.${method} failed: ${rendered}`);
+      }
+    }) as Console[typeof method];
+  }
+}
+
 function getSafeExternalUrl(rawUrl: unknown): string | null {
   if (typeof rawUrl !== "string" || rawUrl.length === 0) {
     return null;
@@ -158,6 +226,15 @@ function getSafeTheme(rawTheme: unknown): DesktopTheme | null {
   }
 
   return null;
+}
+
+function parsePortOverride(rawPort: string): number | null {
+  if (rawPort.length === 0) return null;
+  const value = Number(rawPort);
+  if (!Number.isInteger(value) || value < 1 || value > 65_535) {
+    throw new Error(`Invalid T3CODE_DESKTOP_SERVER_PORT value: ${rawPort}`);
+  }
+  return value;
 }
 
 function writeDesktopStreamChunk(
@@ -919,13 +996,22 @@ function configureAutoUpdater(): void {
   updatePollTimer.unref();
 }
 function backendEnv(): NodeJS.ProcessEnv {
+  const host = DESKTOP_SERVER_HOST.trim();
+  const env = { ...process.env };
+  // Keep Vite dev URL for Electron renderer, but prevent backend HTTP from redirecting
+  // remote clients to localhost.
+  delete env.VITE_DEV_SERVER_URL;
   return {
-    ...process.env,
+    ...env,
     T3CODE_MODE: "desktop",
     T3CODE_NO_BROWSER: "1",
     T3CODE_PORT: String(backendPort),
     T3CODE_HOME: BASE_DIR,
     T3CODE_AUTH_TOKEN: backendAuthToken,
+    ...(DESKTOP_REMOTE_PASSWORD_OVERRIDE.length > 0
+      ? { T3CODE_REMOTE_PASSWORD: DESKTOP_REMOTE_PASSWORD_OVERRIDE }
+      : {}),
+    ...(host.length > 0 ? { T3CODE_HOST: host } : {}),
   };
 }
 
@@ -934,7 +1020,7 @@ function scheduleBackendRestart(reason: string): void {
 
   const delayMs = Math.min(500 * 2 ** restartAttempt, 10_000);
   restartAttempt += 1;
-  console.error(`[desktop] backend exited unexpectedly (${reason}); restarting in ${delayMs}ms`);
+  safeConsoleError(`[desktop] backend exited unexpectedly (${reason}); restarting in ${delayMs}ms`);
 
   restartTimer = setTimeout(() => {
     restartTimer = null;
@@ -1308,18 +1394,27 @@ function createWindow(): BrowserWindow {
 // Chromium session data uses a filesystem-friendly directory name.
 // Must be called synchronously at the top level — before `app.whenReady()`.
 app.setPath("userData", resolveUserDataPath());
+installSafeConsoleWriteGuards();
 
 configureAppIdentity();
 
 async function bootstrap(): Promise<void> {
   writeDesktopLogHeader("bootstrap start");
-  backendPort = await Effect.service(NetService).pipe(
-    Effect.flatMap((net) => net.reserveLoopbackPort()),
-    Effect.provide(NetService.layer),
-    Effect.runPromise,
+  const portOverride = parsePortOverride(DESKTOP_SERVER_PORT_OVERRIDE);
+  backendPort =
+    portOverride ??
+    (await Effect.service(NetService).pipe(
+      Effect.flatMap((net) => net.reserveLoopbackPort()),
+      Effect.provide(NetService.layer),
+      Effect.runPromise,
+    ));
+  writeDesktopLogHeader(
+    `resolved backend bind host=${DESKTOP_SERVER_HOST} port=${backendPort}${portOverride ? " (override)" : ""}`,
   );
-  writeDesktopLogHeader(`reserved backend port via NetService port=${backendPort}`);
-  backendAuthToken = Crypto.randomBytes(24).toString("hex");
+  backendAuthToken =
+    DESKTOP_SERVER_AUTH_TOKEN_OVERRIDE.length > 0
+      ? DESKTOP_SERVER_AUTH_TOKEN_OVERRIDE
+      : Crypto.randomBytes(24).toString("hex");
   backendWsUrl = `ws://127.0.0.1:${backendPort}/?token=${encodeURIComponent(backendAuthToken)}`;
   process.env.T3CODE_DESKTOP_WS_URL = backendWsUrl;
   writeDesktopLogHeader(`bootstrap resolved websocket url=${backendWsUrl}`);

@@ -484,6 +484,7 @@ describe("WebSocket Server", () => {
       logWebSocketEvents?: boolean;
       devUrl?: string;
       authToken?: string;
+      remotePassword?: string;
       baseDir?: string;
       staticDir?: string;
       providerLayer?: Layer.Layer<ProviderService, never>;
@@ -520,6 +521,7 @@ describe("WebSocket Server", () => {
       devUrl,
       noBrowser: true,
       authToken: options.authToken,
+      remotePassword: options.remotePassword,
       autoBootstrapProjectFromCwd: options.autoBootstrapProjectFromCwd ?? false,
       logWebSocketEvents: options.logWebSocketEvents ?? Boolean(options.devUrl),
     } satisfies ServerConfigShape);

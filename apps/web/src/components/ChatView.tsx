@@ -92,13 +92,18 @@ import PlanSidebar from "./PlanSidebar";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
 import {
   BotIcon,
+  CameraIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   CircleAlertIcon,
+  FileIcon,
+  FolderIcon,
   ListTodoIcon,
   LockIcon,
   LockOpenIcon,
+  MicIcon,
+  VideoIcon,
   XIcon,
 } from "lucide-react";
 import { Button } from "./ui/button";
@@ -203,6 +208,57 @@ function formatOutgoingPrompt(params: {
 const COMPOSER_PATH_QUERY_DEBOUNCE_MS = 120;
 const SCRIPT_TERMINAL_COLS = 120;
 const SCRIPT_TERMINAL_ROWS = 30;
+const COMPOSER_VISUAL_PROOF_MODE_STORAGE_KEY = "chat_composer_visual_proof_mode";
+type ComposerVisualProofMode = "off" | "screenshot" | "video";
+
+interface SpeechRecognitionAlternativeLike {
+  transcript: string;
+}
+
+interface SpeechRecognitionResultLike {
+  0: SpeechRecognitionAlternativeLike;
+}
+
+interface SpeechRecognitionEventLike {
+  readonly resultIndex: number;
+  readonly results: ArrayLike<SpeechRecognitionResultLike>;
+}
+
+interface SpeechRecognitionLike {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start(): void;
+  stop(): void;
+  addEventListener(type: "result", listener: (event: SpeechRecognitionEventLike) => void): void;
+  addEventListener(type: "error", listener: (event: { error?: string }) => void): void;
+  addEventListener(type: "end", listener: () => void): void;
+}
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+function visualProofInstruction(mode: ComposerVisualProofMode): string | null {
+  if (mode === "screenshot") {
+    return (
+      "After finishing the requested work, include screenshot evidence of the result. " +
+      "If automation is used, include screenshot artifact path(s) in your response."
+    );
+  }
+  if (mode === "video") {
+    return (
+      "After finishing the requested work, include a short video recording of the result when possible. " +
+      "If video is unavailable, include screenshot evidence and explain why."
+    );
+  }
+  return null;
+}
+
+function parentPath(path: string | null): string | null {
+  if (!path) return null;
+  const lastSlash = path.lastIndexOf("/");
+  if (lastSlash <= 0) return null;
+  return path.slice(0, lastSlash);
+}
 
 const extendReplacementRangeForTrailingSpace = (
   text: string,
@@ -360,6 +416,24 @@ export default function ChatView({ threadId }: ChatViewProps) {
     {},
     LastInvokedScriptByProjectSchema,
   );
+  const [composerVisualProofMode, setComposerVisualProofMode] = useState<ComposerVisualProofMode>(
+    () => {
+      if (typeof window === "undefined") {
+        return "off";
+      }
+      const raw = window.localStorage.getItem(COMPOSER_VISUAL_PROOF_MODE_STORAGE_KEY);
+      if (raw === "screenshot" || raw === "video" || raw === "off") {
+        return raw;
+      }
+      return "off";
+    },
+  );
+  const [isVoiceCaptureActive, setIsVoiceCaptureActive] = useState(false);
+  const [pathPickerOpen, setPathPickerOpen] = useState(false);
+  const [pathPickerDirectory, setPathPickerDirectory] = useState<string | null>(null);
+  const [pathPickerEntries, setPathPickerEntries] = useState<readonly ProjectEntry[]>([]);
+  const [pathPickerLoading, setPathPickerLoading] = useState(false);
+  const [pathPickerError, setPathPickerError] = useState<string | null>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const [messagesScrollElement, setMessagesScrollElement] = useState<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -386,6 +460,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const sendInFlightRef = useRef(false);
   const dragDepthRef = useRef(0);
   const terminalOpenByThreadRef = useRef<Record<string, boolean>>({});
+  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const setMessagesScrollContainerRef = useCallback((element: HTMLDivElement | null) => {
     messagesScrollRef.current = element;
     setMessagesScrollElement(element);
@@ -407,6 +482,85 @@ export default function ChatView({ threadId }: ChatViewProps) {
     },
     [setComposerDraftPrompt, threadId],
   );
+  const setPromptWithCursor = useCallback(
+    (nextPrompt: string) => {
+      promptRef.current = nextPrompt;
+      setPrompt(nextPrompt);
+      const nextCursor = collapseExpandedComposerCursor(nextPrompt, nextPrompt.length);
+      setComposerCursor(nextCursor);
+      setComposerTrigger(detectComposerTrigger(nextPrompt, nextPrompt.length));
+      composerEditorRef.current?.focusAt(nextCursor);
+    },
+    [setPrompt],
+  );
+  const appendToPrompt = useCallback(
+    (text: string) => {
+      const incoming = text.trim();
+      if (incoming.length === 0) return;
+      const current = promptRef.current;
+      const separator = current.trim().length === 0 || /\s$/.test(current) ? "" : " ";
+      setPromptWithCursor(`${current}${separator}${incoming}`);
+    },
+    [setPromptWithCursor],
+  );
+  const stopVoiceCapture = useCallback(() => {
+    speechRecognitionRef.current?.stop();
+    speechRecognitionRef.current = null;
+    setIsVoiceCaptureActive(false);
+  }, []);
+  const startVoiceCapture = useCallback(() => {
+    if (isVoiceCaptureActive) {
+      stopVoiceCapture();
+      return;
+    }
+    if (typeof window === "undefined") return;
+    const speechWindow = window as Window & {
+      SpeechRecognition?: SpeechRecognitionConstructor;
+      webkitSpeechRecognition?: SpeechRecognitionConstructor;
+    };
+    const SpeechRecognitionCtor =
+      speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+    if (!SpeechRecognitionCtor) {
+      toastManager.add({
+        type: "warning",
+        title: "Voice input unavailable",
+        description: "Your browser does not support speech recognition.",
+      });
+      return;
+    }
+
+    const recognition = new SpeechRecognitionCtor();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = "en-US";
+    recognition.addEventListener("result", (event) => {
+      const transcript = Array.from(event.results)
+        .slice(event.resultIndex)
+        .map((result) => result[0].transcript)
+        .join(" ");
+      appendToPrompt(transcript);
+    });
+    recognition.addEventListener("error", (event) => {
+      toastManager.add({
+        type: "warning",
+        title: "Voice input error",
+        description: event.error ? `Could not transcribe: ${event.error}` : "Could not transcribe.",
+      });
+      stopVoiceCapture();
+    });
+    recognition.addEventListener("end", () => {
+      speechRecognitionRef.current = null;
+      setIsVoiceCaptureActive(false);
+    });
+    speechRecognitionRef.current = recognition;
+    setIsVoiceCaptureActive(true);
+    recognition.start();
+  }, [appendToPrompt, isVoiceCaptureActive, stopVoiceCapture]);
+  useEffect(() => () => stopVoiceCapture(), [stopVoiceCapture]);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(COMPOSER_VISUAL_PROOF_MODE_STORAGE_KEY, composerVisualProofMode);
+  }, [composerVisualProofMode]);
   const addComposerImage = useCallback(
     (image: ComposerImageAttachment) => {
       addComposerDraftImage(threadId, image);
@@ -482,6 +636,54 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const activeLatestTurn = activeThread?.latestTurn ?? null;
   const latestTurnSettled = isLatestTurnSettled(activeLatestTurn, activeThread?.session ?? null);
   const activeProject = projects.find((p) => p.id === activeThread?.projectId);
+  const pathPickerVisibleEntries = useMemo(() => {
+    const currentParent = pathPickerDirectory ?? null;
+    const entries = pathPickerEntries.filter(
+      (entry) => (entry.parentPath ?? null) === currentParent,
+    );
+    const sortByPath = (left: ProjectEntry, right: ProjectEntry) =>
+      left.path.localeCompare(right.path);
+    const directories = entries.filter((entry) => entry.kind === "directory").toSorted(sortByPath);
+    const files = entries.filter((entry) => entry.kind === "file").toSorted(sortByPath);
+    return [...directories, ...files];
+  }, [pathPickerDirectory, pathPickerEntries]);
+
+  useEffect(() => {
+    if (!pathPickerOpen) return;
+    if (!activeProject?.cwd) return;
+    const api = readNativeApi();
+    if (!api) return;
+    let cancelled = false;
+    setPathPickerLoading(true);
+    setPathPickerError(null);
+    const query = pathPickerDirectory ? `${pathPickerDirectory}/` : "";
+    void api.projects
+      .searchEntries({
+        cwd: activeProject.cwd,
+        query,
+        limit: 200,
+      })
+      .then((result) => {
+        if (cancelled) return;
+        setPathPickerEntries(result.entries);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setPathPickerError(error instanceof Error ? error.message : "Failed to load paths.");
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setPathPickerLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProject?.cwd, pathPickerDirectory, pathPickerOpen]);
+
+  useEffect(() => {
+    if (!pathPickerOpen) return;
+    setPathPickerDirectory(null);
+  }, [activeThread?.id, pathPickerOpen]);
 
   const openPullRequestDialog = useCallback(
     (reference?: string) => {
@@ -619,16 +821,24 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const selectedPromptEffort = composerProviderState.promptEffort;
   const selectedModelOptionsForDispatch = composerProviderState.modelOptionsForDispatch;
   const providerOptionsForDispatch = useMemo(() => {
-    if (!settings.codexBinaryPath && !settings.codexHomePath) {
+    if (!settings.codexBinaryPath && !settings.codexHomePath && !settings.claudeBinaryPath) {
       return undefined;
     }
+    const codexOptions =
+      settings.codexBinaryPath || settings.codexHomePath
+        ? {
+            ...(settings.codexBinaryPath ? { binaryPath: settings.codexBinaryPath } : {}),
+            ...(settings.codexHomePath ? { homePath: settings.codexHomePath } : {}),
+          }
+        : undefined;
+    const claudeOptions = settings.claudeBinaryPath
+      ? { binaryPath: settings.claudeBinaryPath }
+      : undefined;
     return {
-      codex: {
-        ...(settings.codexBinaryPath ? { binaryPath: settings.codexBinaryPath } : {}),
-        ...(settings.codexHomePath ? { homePath: settings.codexHomePath } : {}),
-      },
+      ...(codexOptions ? { codex: codexOptions } : {}),
+      ...(claudeOptions ? { claudeAgent: claudeOptions } : {}),
     };
-  }, [settings.codexBinaryPath, settings.codexHomePath]);
+  }, [settings.claudeBinaryPath, settings.codexBinaryPath, settings.codexHomePath]);
   const selectedModelForPicker = selectedModel;
   const modelOptionsByProvider = useMemo(
     () => getCustomModelOptionsByProvider(settings),
@@ -2429,10 +2639,15 @@ export default function ChatView({ threadId }: ChatViewProps) {
 
     const composerImagesSnapshot = [...composerImages];
     const composerTerminalContextsSnapshot = [...sendableComposerTerminalContexts];
-    const messageTextForSend = appendTerminalContextsToPrompt(
+    const baseMessageTextForSend = appendTerminalContextsToPrompt(
       promptForSend,
       composerTerminalContextsSnapshot,
     );
+    const proofInstruction = visualProofInstruction(composerVisualProofMode);
+    const messageTextForSend =
+      proofInstruction && proofInstruction.length > 0
+        ? `${baseMessageTextForSend.trim().length > 0 ? `${baseMessageTextForSend}\n\n` : ""}[Execution requirement]\n${proofInstruction}`
+        : baseMessageTextForSend;
     const messageIdForSend = newMessageId();
     const messageCreatedAt = new Date().toISOString();
     const outgoingMessageText = formatOutgoingPrompt({
@@ -2669,6 +2884,36 @@ export default function ChatView({ threadId }: ChatViewProps) {
       resetSendPhase();
     }
   };
+
+  const cycleVisualProofMode = useCallback(() => {
+    setComposerVisualProofMode((current) => {
+      if (current === "off") return "screenshot";
+      if (current === "screenshot") return "video";
+      return "off";
+    });
+  }, [setComposerVisualProofMode]);
+  const togglePathPicker = useCallback(() => {
+    setPathPickerOpen((open) => !open);
+    setPathPickerDirectory(null);
+    setPathPickerError(null);
+  }, []);
+  const openPathPickerDirectory = useCallback((path: string) => {
+    setPathPickerDirectory(path);
+    setPathPickerError(null);
+  }, []);
+  const goToPathPickerParent = useCallback(() => {
+    setPathPickerDirectory((current) => parentPath(current));
+    setPathPickerError(null);
+  }, []);
+  const insertPathFromPicker = useCallback(
+    (entryPath: string) => {
+      appendToPrompt(`@${entryPath}`);
+      setPathPickerOpen(false);
+      setPathPickerDirectory(null);
+      setPathPickerError(null);
+    },
+    [appendToPrompt],
+  );
 
   const onInterrupt = async () => {
     const api = readNativeApi();
@@ -3735,6 +3980,125 @@ export default function ChatView({ threadId }: ChatViewProps) {
                       }
                       disabled={isConnecting || isComposerApprovalState}
                     />
+
+                    {!isComposerApprovalState && pendingUserInputs.length === 0 ? (
+                      <div className="mt-2 min-w-0">
+                        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={pathPickerOpen ? "default" : "ghost"}
+                            className="h-8 shrink-0 rounded-full px-3"
+                            onClick={togglePathPicker}
+                            title="Browse project paths"
+                          >
+                            <FolderIcon className="size-3.5" />
+                            <span>Path</span>
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={isVoiceCaptureActive ? "default" : "ghost"}
+                            className={cn(
+                              "h-8 shrink-0 rounded-full px-3",
+                              isVoiceCaptureActive ? "bg-rose-500 hover:bg-rose-500/90" : "",
+                            )}
+                            onClick={startVoiceCapture}
+                            title={
+                              isVoiceCaptureActive
+                                ? "Stop voice input"
+                                : "Start voice-to-text input"
+                            }
+                          >
+                            <MicIcon className="size-3.5" />
+                            <span>{isVoiceCaptureActive ? "Listening" : "Voice"}</span>
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={composerVisualProofMode === "off" ? "ghost" : "default"}
+                            className="h-8 shrink-0 rounded-full px-3"
+                            onClick={cycleVisualProofMode}
+                            title="Cycle proof mode: Off → Screenshot → Video"
+                          >
+                            {composerVisualProofMode === "video" ? (
+                              <VideoIcon className="size-3.5" />
+                            ) : (
+                              <CameraIcon className="size-3.5" />
+                            )}
+                            <span>
+                              Proof:{" "}
+                              {composerVisualProofMode === "off"
+                                ? "Off"
+                                : composerVisualProofMode === "screenshot"
+                                  ? "Shot"
+                                  : "Video"}
+                            </span>
+                          </Button>
+                        </div>
+
+                        {pathPickerOpen ? (
+                          <div className="mt-2 overflow-hidden rounded-lg border border-border/75 bg-background/90">
+                            <div className="flex items-center gap-1 border-border/60 border-b px-2 py-1.5">
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 shrink-0 px-2"
+                                onClick={goToPathPickerParent}
+                                disabled={pathPickerDirectory === null}
+                                title="Go up one folder"
+                              >
+                                <ChevronLeftIcon className="size-3.5" />
+                                <span className="sr-only">Up</span>
+                              </Button>
+                              <div className="min-w-0 flex-1 truncate text-muted-foreground/80 text-xs">
+                                {pathPickerDirectory ?? "/"}
+                              </div>
+                            </div>
+                            <div className="max-h-44 overflow-y-auto py-1">
+                              {pathPickerLoading ? (
+                                <div className="px-3 py-2 text-muted-foreground text-xs">
+                                  Loading paths...
+                                </div>
+                              ) : pathPickerError ? (
+                                <div className="px-3 py-2 text-destructive text-xs">
+                                  {pathPickerError}
+                                </div>
+                              ) : pathPickerVisibleEntries.length === 0 ? (
+                                <div className="px-3 py-2 text-muted-foreground text-xs">
+                                  No entries in this folder.
+                                </div>
+                              ) : (
+                                pathPickerVisibleEntries.map((entry) => (
+                                  <button
+                                    key={`${entry.kind}:${entry.path}`}
+                                    type="button"
+                                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm hover:bg-accent/60"
+                                    onClick={() =>
+                                      entry.kind === "directory"
+                                        ? openPathPickerDirectory(entry.path)
+                                        : insertPathFromPicker(entry.path)
+                                    }
+                                  >
+                                    {entry.kind === "directory" ? (
+                                      <FolderIcon className="size-3.5 shrink-0 text-muted-foreground/80" />
+                                    ) : (
+                                      <FileIcon className="size-3.5 shrink-0 text-muted-foreground/80" />
+                                    )}
+                                    <span className="truncate">
+                                      {pathPickerDirectory
+                                        ? entry.path.slice(pathPickerDirectory.length + 1)
+                                        : entry.path}
+                                    </span>
+                                  </button>
+                                ))
+                              )}
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
 
                   {/* Bottom toolbar */}
@@ -3752,18 +4116,16 @@ export default function ChatView({ threadId }: ChatViewProps) {
                     <div
                       data-chat-composer-footer="true"
                       className={cn(
-                        "flex items-center justify-between px-2.5 pb-2.5 sm:px-3 sm:pb-3",
-                        isComposerFooterCompact
-                          ? "gap-1.5"
-                          : "flex-wrap gap-2 sm:flex-nowrap sm:gap-0",
+                        "flex w-full items-center justify-between px-2.5 pb-2.5 sm:px-3 sm:pb-3",
+                        isComposerFooterCompact ? "gap-1.5" : "flex-wrap gap-2 sm:gap-2",
                       )}
                     >
                       <div
                         className={cn(
-                          "flex min-w-0 flex-1 items-center",
+                          "flex min-w-0 max-w-full flex-1 items-center",
                           isComposerFooterCompact
                             ? "gap-1 overflow-hidden"
-                            : "gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden sm:min-w-max sm:overflow-visible",
+                            : "gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden sm:overflow-visible",
                         )}
                       >
                         {/* Provider/model picker */}
@@ -3892,12 +4254,34 @@ export default function ChatView({ threadId }: ChatViewProps) {
                       {/* Right side: send / stop button */}
                       <div
                         data-chat-composer-actions="right"
-                        className="flex shrink-0 items-center gap-2"
+                        className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2"
                       >
                         {isPreparingWorktree ? (
                           <span className="text-muted-foreground/70 text-xs">
                             Preparing worktree...
                           </span>
+                        ) : null}
+                        {!activePendingProgress && pendingUserInputs.length === 0 ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={isVoiceCaptureActive ? "default" : "ghost"}
+                            className={cn(
+                              "h-9 rounded-full px-3 sm:h-8",
+                              isVoiceCaptureActive ? "bg-rose-500 hover:bg-rose-500/90" : "",
+                            )}
+                            onClick={startVoiceCapture}
+                            title={
+                              isVoiceCaptureActive
+                                ? "Stop voice input"
+                                : "Start voice-to-text input"
+                            }
+                          >
+                            <MicIcon className="size-3.5" />
+                            <span className="text-xs">
+                              {isVoiceCaptureActive ? "Listening" : "Voice"}
+                            </span>
+                          </Button>
                         ) : null}
                         {activePendingProgress ? (
                           <div className="flex items-center gap-2">

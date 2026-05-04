@@ -28,6 +28,37 @@ const RECONNECT_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000];
 const decodeWsResponse = decodeUnknownJsonResult(WsResponseSchema);
 const isWebSocketResponseEnvelope = Schema.is(WebSocketResponse);
 
+function readQueryParamFromLocationSearch(name: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const value = new URLSearchParams(window.location.search).get(name);
+    if (!value) return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
+function withAuthQuery(
+  url: string,
+  input: { token: string | null; password: string | null },
+): string {
+  if (!input.token && !input.password) return url;
+  try {
+    const parsed = new URL(url);
+    if (input.token && !parsed.searchParams.get("token")) {
+      parsed.searchParams.set("token", input.token);
+    }
+    if (input.password && !parsed.searchParams.get("password")) {
+      parsed.searchParams.set("password", input.password);
+    }
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
 const isWsPushMessage = (value: WsResponseMessage): value is WsPush =>
   "type" in value && value.type === "push";
 
@@ -62,13 +93,17 @@ export class WsTransport {
   constructor(url?: string) {
     const bridgeUrl = window.desktopBridge?.getWsUrl();
     const envUrl = import.meta.env.VITE_WS_URL as string | undefined;
-    this.url =
+    const resolvedUrl =
       url ??
       (bridgeUrl && bridgeUrl.length > 0
         ? bridgeUrl
         : envUrl && envUrl.length > 0
           ? envUrl
           : `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:${window.location.port}`);
+    this.url = withAuthQuery(resolvedUrl, {
+      token: readQueryParamFromLocationSearch("token"),
+      password: readQueryParamFromLocationSearch("password"),
+    });
     this.connect();
   }
 

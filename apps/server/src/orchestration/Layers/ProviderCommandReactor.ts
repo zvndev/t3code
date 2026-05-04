@@ -81,6 +81,11 @@ const sameModelOptions = (
   right: ProviderModelOptions | undefined,
 ): boolean => JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
 
+const sameProviderOptions = (
+  left: ProviderStartOptions | undefined,
+  right: ProviderStartOptions | undefined,
+): boolean => JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+
 function isUnknownPendingApprovalRequestError(cause: Cause.Cause<ProviderServiceError>): boolean {
   const error = Cause.squash(cause);
   if (Schema.is(ProviderAdapterRequestError)(error)) {
@@ -316,18 +321,23 @@ const make = Effect.gen(function* () {
         currentProvider === "claudeAgent" &&
         options?.modelOptions !== undefined &&
         !sameModelOptions(previousModelOptions, options.modelOptions);
+      const previousProviderOptions = threadProviderOptions.get(threadId);
+      const shouldRestartForProviderOptionsChange =
+        options?.providerOptions !== undefined &&
+        !sameProviderOptions(previousProviderOptions, options.providerOptions);
 
       if (
         !runtimeModeChanged &&
         !providerChanged &&
         !shouldRestartForModelChange &&
-        !shouldRestartForModelOptionsChange
+        !shouldRestartForModelOptionsChange &&
+        !shouldRestartForProviderOptionsChange
       ) {
         return existingSessionThreadId;
       }
 
       const resumeCursor =
-        providerChanged || shouldRestartForModelChange
+        providerChanged || shouldRestartForModelChange || shouldRestartForProviderOptionsChange
           ? undefined
           : (activeSession?.resumeCursor ?? undefined);
       yield* Effect.logInfo("provider command reactor restarting provider session", {
@@ -342,6 +352,7 @@ const make = Effect.gen(function* () {
         modelChanged,
         shouldRestartForModelChange,
         shouldRestartForModelOptionsChange,
+        shouldRestartForProviderOptionsChange,
         hasResumeCursor: resumeCursor !== undefined,
       });
       const restartedSession = yield* startProviderSession({

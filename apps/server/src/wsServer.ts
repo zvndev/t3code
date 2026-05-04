@@ -121,6 +121,17 @@ function rejectUpgrade(socket: Duplex, statusCode: number, message: string): voi
   );
 }
 
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  const normalized = address.trim().toLowerCase();
+  return (
+    normalized === "::1" ||
+    normalized === "127.0.0.1" ||
+    normalized === "::ffff:127.0.0.1" ||
+    normalized.startsWith("127.")
+  );
+}
+
 function websocketRawToString(raw: unknown): string | null {
   if (typeof raw === "string") {
     return raw;
@@ -244,6 +255,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     staticDir,
     devUrl,
     authToken,
+    remotePassword,
     host,
     logWebSocketEvents,
     autoBootstrapProjectFromCwd,
@@ -932,19 +944,34 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
   httpServer.on("upgrade", (request, socket, head) => {
     socket.on("error", () => {}); // Prevent unhandled `EPIPE`/`ECONNRESET` from crashing the process if the client disconnects mid-handshake
 
-    if (authToken) {
-      let providedToken: string | null = null;
+    const shouldRequireRemotePassword =
+      typeof remotePassword === "string" &&
+      remotePassword.length > 0 &&
+      !isLoopbackAddress(request.socket.remoteAddress);
+
+    if (authToken || shouldRequireRemotePassword) {
+      let requestUrl: URL | null = null;
       try {
-        const url = new URL(request.url ?? "/", `http://localhost:${port}`);
-        providedToken = url.searchParams.get("token");
+        requestUrl = new URL(request.url ?? "/", `http://localhost:${port}`);
       } catch {
         rejectUpgrade(socket, 400, "Invalid WebSocket URL");
         return;
       }
 
-      if (providedToken !== authToken) {
-        rejectUpgrade(socket, 401, "Unauthorized WebSocket connection");
-        return;
+      if (authToken) {
+        const providedToken = requestUrl.searchParams.get("token");
+        if (providedToken !== authToken) {
+          rejectUpgrade(socket, 401, "Unauthorized WebSocket connection");
+          return;
+        }
+      }
+
+      if (shouldRequireRemotePassword) {
+        const providedPassword = requestUrl.searchParams.get("password");
+        if (providedPassword !== remotePassword) {
+          rejectUpgrade(socket, 401, "Unauthorized WebSocket password");
+          return;
+        }
       }
     }
 

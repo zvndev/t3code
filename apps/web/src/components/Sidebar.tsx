@@ -79,6 +79,7 @@ import {
   SidebarMenuSubItem,
   SidebarSeparator,
   SidebarTrigger,
+  useSidebar,
 } from "./ui/sidebar";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "../worktreeCleanup";
@@ -253,6 +254,11 @@ function SortableProjectItem({
 }
 
 export default function Sidebar() {
+  const {
+    isMobile: isMobileSidebar,
+    openMobile: isSidebarOpenMobile,
+    setOpenMobile: setSidebarOpenMobile,
+  } = useSidebar();
   const projects = useStore((store) => store.projects);
   const threads = useStore((store) => store.threads);
   const markThreadUnread = useStore((store) => store.markThreadUnread);
@@ -398,8 +404,11 @@ export default function Sidebar() {
         to: "/$threadId",
         params: { threadId: latestThread.id },
       });
+      if (isMobileSidebar && isSidebarOpenMobile) {
+        setSidebarOpenMobile(false);
+      }
     },
-    [navigate, threads],
+    [isMobileSidebar, isSidebarOpenMobile, navigate, setSidebarOpenMobile, threads],
   );
 
   const addProjectFromPath = useCallback(
@@ -627,6 +636,9 @@ export default function Sidebar() {
         } else {
           void navigate({ to: "/", replace: true });
         }
+        if (isMobileSidebar && isSidebarOpenMobile) {
+          setSidebarOpenMobile(false);
+        }
       }
 
       if (!shouldDeleteWorktree || !orphanedWorktreePath || !threadProject) {
@@ -662,6 +674,9 @@ export default function Sidebar() {
       projects,
       removeWorktreeMutation,
       routeThreadId,
+      isMobileSidebar,
+      isSidebarOpenMobile,
+      setSidebarOpenMobile,
       threads,
     ],
   );
@@ -848,13 +863,19 @@ export default function Sidebar() {
         to: "/$threadId",
         params: { threadId },
       });
+      if (isMobileSidebar && isSidebarOpenMobile) {
+        setSidebarOpenMobile(false);
+      }
     },
     [
       clearSelection,
+      isMobileSidebar,
+      isSidebarOpenMobile,
       navigate,
       rangeSelectTo,
       selectedThreadIds.size,
       setSelectionAnchor,
+      setSidebarOpenMobile,
       toggleThreadSelection,
     ],
   );
@@ -1496,6 +1517,9 @@ export default function Sidebar() {
                                           to: "/$threadId",
                                           params: { threadId: thread.id },
                                         });
+                                        if (isMobileSidebar && isSidebarOpenMobile) {
+                                          setSidebarOpenMobile(false);
+                                        }
                                       }}
                                       onContextMenu={(event) => {
                                         event.preventDefault();
@@ -1684,7 +1708,12 @@ export default function Sidebar() {
               <SidebarMenuButton
                 size="sm"
                 className="gap-2 px-2 py-1.5 text-muted-foreground/70 hover:bg-accent hover:text-foreground"
-                onClick={() => window.history.back()}
+                onClick={() => {
+                  window.history.back();
+                  if (isMobileSidebar && isSidebarOpenMobile) {
+                    setSidebarOpenMobile(false);
+                  }
+                }}
               >
                 <ArrowLeftIcon className="size-3.5" />
                 <span className="text-xs">Back</span>
@@ -1693,7 +1722,12 @@ export default function Sidebar() {
               <SidebarMenuButton
                 size="sm"
                 className="gap-2 px-2 py-1.5 text-muted-foreground/70 hover:bg-accent hover:text-foreground"
-                onClick={() => void navigate({ to: "/settings" })}
+                onClick={() => {
+                  void navigate({ to: "/settings" });
+                  if (isMobileSidebar && isSidebarOpenMobile) {
+                    setSidebarOpenMobile(false);
+                  }
+                }}
               >
                 <SettingsIcon className="size-3.5" />
                 <span className="text-xs">Settings</span>

@@ -54,6 +54,18 @@ const TIMESTAMP_FORMAT_LABELS = {
   "24-hour": "24-hour",
 } as const;
 
+function extractTokenFromUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    const token = new URL(url).searchParams.get("token");
+    if (!token) return null;
+    const trimmed = token.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
 function SettingsRouteView() {
   const { theme, setTheme, resolvedTheme } = useTheme();
   const { settings, defaults, updateSettings } = useAppSettings();
@@ -72,6 +84,8 @@ function SettingsRouteView() {
 
   const codexBinaryPath = settings.codexBinaryPath;
   const codexHomePath = settings.codexHomePath;
+  const claudeBinaryPath = settings.claudeBinaryPath;
+  const desktopWebSocketToken = extractTokenFromUrl(window.desktopBridge?.getWsUrl?.());
   const keybindingsConfigPath = serverConfigQuery.data?.keybindingsConfigPath ?? null;
   const availableEditors = serverConfigQuery.data?.availableEditors;
 
@@ -342,6 +356,71 @@ function SettingsRouteView() {
                 </div>
               </div>
             </section>
+
+            <section className="rounded-2xl border border-border bg-card p-5">
+              <div className="mb-4">
+                <h2 className="text-sm font-medium text-foreground">Claude Code</h2>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Use a custom Claude executable path for account/profile switching wrappers.
+                </p>
+              </div>
+
+              <div className="space-y-4">
+                <label htmlFor="claude-binary-path" className="block space-y-1">
+                  <span className="text-xs font-medium text-foreground">Claude binary path</span>
+                  <Input
+                    id="claude-binary-path"
+                    value={claudeBinaryPath}
+                    onChange={(event) => updateSettings({ claudeBinaryPath: event.target.value })}
+                    placeholder="claude"
+                    spellCheck={false}
+                  />
+                  <span className="text-xs text-muted-foreground">
+                    Leave blank to use <code>claude</code> from your PATH.
+                  </span>
+                </label>
+
+                <div className="flex flex-col gap-3 text-xs text-muted-foreground sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0 flex-1">
+                    <p>Binary source</p>
+                    <p className="mt-1 break-all font-mono text-[11px] text-foreground">
+                      {claudeBinaryPath || "PATH"}
+                    </p>
+                  </div>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    className="self-start"
+                    onClick={() =>
+                      updateSettings({
+                        claudeBinaryPath: defaults.claudeBinaryPath,
+                      })
+                    }
+                  >
+                    Reset claude override
+                  </Button>
+                </div>
+              </div>
+            </section>
+
+            {isElectron ? (
+              <section className="rounded-2xl border border-border bg-card p-5">
+                <div className="mb-4">
+                  <h2 className="text-sm font-medium text-foreground">Remote Access</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Use this token when opening the desktop-hosted app from mobile via
+                    <code className="mx-1">http://&lt;desktop-ip&gt;:&lt;port&gt;/?token=...</code>.
+                  </p>
+                </div>
+
+                <div className="rounded-lg border border-border bg-background px-3 py-2">
+                  <p className="text-xs font-medium text-foreground">WebSocket auth token</p>
+                  <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
+                    {desktopWebSocketToken ?? "Token unavailable"}
+                  </p>
+                </div>
+              </section>
+            ) : null}
 
             <section className="rounded-2xl border border-border bg-card p-5">
               <div className="mb-4">

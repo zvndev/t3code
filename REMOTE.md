@@ -63,3 +63,46 @@ Open from any device in your tailnet:
 `http://<tailnet-ip>:3773`
 
 You can also bind `--host 0.0.0.0` and connect through the Tailnet IP, but binding directly to the Tailnet IP limits exposure.
+
+## Desktop app remote access (mobile browser)
+
+When using the Electron desktop app, you can force a stable host/port/token/password for remote device access:
+
+```bash
+T3CODE_DESKTOP_SERVER_HOST=0.0.0.0 \
+T3CODE_DESKTOP_SERVER_PORT=3773 \
+T3CODE_DESKTOP_SERVER_AUTH_TOKEN="$(openssl rand -hex 24)" \
+T3CODE_DESKTOP_REMOTE_PASSWORD="choose-a-strong-password" \
+bun run dev:desktop
+```
+
+Then open this URL from your phone:
+
+`http://<your-machine-ip>:3773/?token=<same-token>&password=<same-password>`
+
+Notes:
+
+- `?token=...` is required for WebSocket auth on remote browser clients.
+- `?password=...` is optional unless `T3CODE_REMOTE_PASSWORD` / `T3CODE_DESKTOP_REMOTE_PASSWORD` is set.
+- Remote password checks apply only to non-loopback clients so local desktop flows are unchanged.
+- Keep the token secret; anyone with the URL can connect.
+- In desktop mode, the app UI still connects locally via loopback.
+
+## Tailscale remote access
+
+If your desktop and phone are both on your Tailnet, bind to the Tailnet IP:
+
+```bash
+TAILNET_IP="$(tailscale ip -4)"
+TOKEN="$(openssl rand -hex 24)"
+PASSWORD="choose-a-strong-password"
+T3CODE_DESKTOP_SERVER_HOST="$TAILNET_IP" \
+T3CODE_DESKTOP_SERVER_PORT=3773 \
+T3CODE_DESKTOP_SERVER_AUTH_TOKEN="$TOKEN" \
+T3CODE_DESKTOP_REMOTE_PASSWORD="$PASSWORD" \
+bun run dev:desktop
+```
+
+Then open:
+
+`http://<tailnet-ip>:3773/?token=<token>&password=<password>`
