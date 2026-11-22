@@ -1,9 +1,17 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import { AuthSessionId, ProjectId, RunId, ThreadId } from "@t3tools/contracts";
+import {
+  AuthSessionId,
+  DEFAULT_SERVER_SETTINGS,
+  DEFAULT_SNOOZE_PRESETS,
+  ProjectId,
+  RunId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NetService from "@t3tools/shared/Net";
+import { localSnoozeDate, localSnoozeTime } from "@t3tools/shared/snooze";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -12,6 +20,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import * as TestClock from "effect/testing/TestClock";
 import * as TestConsole from "effect/testing/TestConsole";
@@ -28,6 +37,7 @@ import {
   launchModelSelection,
   readLatestMessages,
   resolveProject,
+  snoozeWakeTime,
   threadCommand,
   type ThreadTools,
   titleFromMessage,
@@ -46,6 +56,23 @@ vi.mock("../auth/EnvironmentAuth.ts", async (importOriginal) => {
           expiresAt,
         })),
       revokeSession: () => Effect.succeed(true),
+    }),
+  };
+});
+
+vi.mock("../serverSettings.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../serverSettings.ts")>();
+  return {
+    ...actual,
+    layer: Layer.mock(actual.ServerSettingsService)({
+      getSettings: Effect.succeed({
+        ...DEFAULT_SERVER_SETTINGS,
+        // An option changed in Settings, and a today option the test clock is always past.
+        snoozePresets: [
+          { kind: "after", minutes: 45 },
+          { kind: "at", day: "today", time: "00:00" },
+        ],
+      }),
     }),
   };
 });
@@ -178,6 +205,124 @@ it.effect("does not sign in to whatever took over a dead server's port", () =>
       ),
     ),
   ),
+);
+
+const decodeListedSnoozeOptions = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Array(
+      Schema.Struct({ id: Schema.String, label: Schema.String, snoozedUntil: Schema.String }),
+    ),
+  ),
+);
+
+it.effect("snooze offers the environment's snooze options and snoozes until the one chosen", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-thread-snooze-" });
+    yield* persistServerRuntimeState({
+      path: path.join(baseDir, "userdata", "server-runtime.json"),
+      state: yield* makePersistedServerRuntimeState({
+        config: { host: "127.0.0.1", devUrl: undefined },
+        port: 3_773,
+      }),
+    });
+    const organized: Array<unknown> = [];
+    using _session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
+      Effect.succeed({
+        call: (tool, args) => {
+          if (tool !== "t3_thread_organize") return Effect.die(`unexpected ${tool} call`);
+          organized.push(args);
+          return Effect.succeed({ structuredContent: { sequence: organized.length } });
+        },
+      }),
+    );
+    const run = (...args: ReadonlyArray<string>) =>
+      Command.runWith(threadCommand, { version: "0.0.0" })([
+        ...args,
+        "--json",
+        "--base-dir",
+        baseDir,
+      ]).pipe(
+        Effect.andThen(TestConsole.logLines),
+        Effect.map((lines) => String(lines.at(-1))),
+      );
+
+    assert.deepStrictEqual(yield* decodeListedSnoozeOptions(yield* run("snooze", threadId)), [
+      { id: "after:45", label: "In 45 minutes", snoozedUntil: "1970-01-01T00:45:00.000Z" },
+    ]);
+
+    assert.strictEqual(
+      yield* run("snooze", threadId, "after:45"),
+      JSON.stringify({ threadId, snoozedUntil: "1970-01-01T00:45:00.000Z" }),
+    );
+    const passed = yield* Effect.flip(run("snooze", threadId, "at:today:00:00"));
+    assert.strictEqual(passed._tag, "ThreadUsageError");
+    assert.deepStrictEqual(organized, [
+      { threadId, action: "snooze", snoozedUntil: "1970-01-01T00:45:00.000Z" },
+    ]);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      Layer.mergeAll(
+        NodeServices.layer,
+        NodeCrypto.layer,
+        NetService.layer,
+        ConfigProvider.layer(ConfigProvider.fromEnv({ env: { T3CODE_PORT: "3773" } })),
+      ),
+    ),
+  ),
+);
+
+it.effect("snooze reads ids, --for, and --until the way the app's snooze menu and dialog do", () =>
+  Effect.gen(function* () {
+    const now = DateTime.toDate(DateTime.makeUnsafe("2026-09-14T12:00:00Z"));
+    const wake = (choice: { readonly for?: string; readonly until?: string }) =>
+      snoozeWakeTime(
+        {
+          option: Option.none(),
+          for: Option.fromUndefinedOr(choice.for),
+          until: Option.fromUndefinedOr(choice.until),
+        },
+        [],
+        now,
+      );
+
+    for (const [duration, expected] of [
+      ["90m", "2026-09-14T13:30:00.000Z"],
+      ["1.5h", "2026-09-14T13:30:00.000Z"],
+      ["2d", "2026-09-16T12:00:00.000Z"],
+    ] as const) {
+      assert.strictEqual(yield* wake({ for: duration }), expected, duration);
+    }
+    for (const until of ["2026-09-20 09:00", "2026-09-20T09:00"]) {
+      const at = DateTime.toDate(DateTime.makeUnsafe(yield* wake({ until })));
+      assert.deepStrictEqual([localSnoozeDate(at), localSnoozeTime(at)], ["2026-09-20", "09:00"]);
+    }
+    for (const choice of [
+      { for: "0h" },
+      { for: "2w" },
+      { until: "2026-09-13 09:00" },
+      { until: "2026-09-20" },
+      { until: "2026-09-20 09:00 PM" },
+    ]) {
+      const error = yield* Effect.flip(wake(choice));
+      assert.strictEqual(error._tag, "ThreadUsageError", JSON.stringify(choice));
+    }
+
+    // On a Sunday the menu shows Tomorrow and leaves out Next week, which wakes the same minute.
+    const sunday = DateTime.toDate(DateTime.makeUnsafe(yield* wake({ until: "2026-09-20 12:00" })));
+    const nextWeek = yield* snoozeWakeTime(
+      { option: Option.some("at:monday:09:00"), for: Option.none(), until: Option.none() },
+      DEFAULT_SNOOZE_PRESETS,
+      sunday,
+    );
+    const monday = DateTime.toDate(DateTime.makeUnsafe(nextWeek));
+    assert.deepStrictEqual(
+      [localSnoozeDate(monday), localSnoozeTime(monday)],
+      ["2026-09-21", "09:00"],
+    );
+  }),
 );
 
 /** Answers each tool call with the next scripted response for that tool. */

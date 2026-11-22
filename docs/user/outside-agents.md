@@ -145,6 +145,7 @@ id=$(t3 thread start . "Find why the tests are slow")
 t3 thread send "$id" "Now fix it" --wait
 t3 thread show "$id"
 t3 thread list
+t3 thread snooze "$id" --for 2h
 ```
 
 `.` means the project that contains the current folder, or a git worktree of
@@ -163,6 +164,14 @@ options.
 `--wait` prints the agent's reply. It exits 1 when the run fails or stops, and
 2 when the agent waits for an answer you give in the app. Add `--json` for a
 result that always includes the thread id.
+
+`t3 thread snooze <id>` lists the choices in the app's snooze menu, from
+**Settings → Threads → Snooze options**. Pass a choice's id, such as
+`at:tomorrow:09:00`, to snooze until it. For a custom time, pass `--for` with
+minutes, hours, or days, such as `--for 90m`, or `--until "2026-11-24 09:00"` in
+local time. `t3 thread list --snoozed` lists this project's snoozed threads and
+when each wakes, and `t3 thread unsnooze <id>` wakes one early. See
+[Snooze until later](thread-sidebar.md#snooze-until-later).
 
 ## Remove an agent
 

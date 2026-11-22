@@ -1,4 +1,5 @@
 import {
+  OrchestrationV2DispatchCommandResult,
   OrchestratorMcpFailure,
   OrchestratorMcpThreadListResult,
   OrchestratorMcpThreadReadResult,
@@ -13,9 +14,17 @@ import {
   type OrchestratorMcpThreadRun,
   type OrchestratorMcpThreadStatus,
   type OrchestratorMcpThreadTimelineItem,
+  type SnoozePresetSetting,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import {
+  resolveCustomSnooze,
+  resolveSnoozePreset,
+  resolveSnoozePresets,
+  snoozePresetId,
+} from "@t3tools/shared/snooze";
 import * as Console from "effect/Console";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -34,6 +43,7 @@ import { mcpToolSession, type McpToolSession } from "../mcp/AcpMcpStdioBridge.ts
 import { expandHomePath } from "../os-jank.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import { readLiveServerRuntimeState } from "../serverRuntimeState.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
 /**
@@ -252,7 +262,8 @@ const withThreadTools = Effect.fn("cli.thread.withThreadTools")(function* <A, E,
     Effect.scoped,
     Effect.provideService(References.MinimumLogLevel, minimumLogLevel),
     Effect.provide(
-      EnvironmentAuth.layerRuntime.pipe(
+      ServerSettings.layer.pipe(
+        Layer.provideMerge(EnvironmentAuth.layerRuntime),
         Layer.provide(ServerConfig.layer(config)),
         Layer.provide(Layer.succeed(References.MinimumLogLevel, minimumLogLevel)),
       ),
@@ -790,6 +801,72 @@ export const launchModelSelection = Effect.fn("cli.thread.launchModelSelection")
   };
 });
 
+const SNOOZE_UNITS = { m: "minutes", h: "hours", d: "days" } as const;
+
+/**
+ * When a snooze ends: one of the environment's snooze options as the app resolves it now, or a
+ * --for duration or --until local time read the way the app's Custom snooze dialog reads them.
+ */
+export const snoozeWakeTime = Effect.fn("cli.thread.snoozeWakeTime")(function* (
+  choice: {
+    readonly option: Option.Option<string>;
+    readonly for: Option.Option<string>;
+    readonly until: Option.Option<string>;
+  },
+  presets: ReadonlyArray<SnoozePresetSetting>,
+  now: Date,
+) {
+  if (Option.isSome(choice.for)) {
+    const [, amount, unit] = /^(\d+(?:\.\d+)?)\s*([mhd])$/.exec(choice.for.value.trim()) ?? [];
+    const wake =
+      amount === undefined || unit === undefined
+        ? null
+        : resolveCustomSnooze(
+            { mode: "duration", amount, unit: SNOOZE_UNITS[unit as keyof typeof SNOOZE_UNITS] },
+            now,
+          );
+    if (wake === null) {
+      return yield* new ThreadUsageError({
+        detail: `--for '${choice.for.value}' is not a positive duration such as 90m, 2h, or 1.5d.`,
+      });
+    }
+    return wake;
+  }
+  if (Option.isSome(choice.until)) {
+    const [, date = "", time = ""] =
+      /^(\d{4}-\d{2}-\d{2})(?:\s+|T)(\d{2}:\d{2})$/.exec(choice.until.value.trim()) ?? [];
+    const wake = resolveCustomSnooze({ mode: "date", date, time }, now);
+    if (wake === null) {
+      return yield* new ThreadUsageError({
+        detail: `--until '${choice.until.value}' is not a future local time as YYYY-MM-DD HH:MM.`,
+      });
+    }
+    return wake;
+  }
+  const id = Option.getOrElse(choice.option, () => "");
+  // Looked up by setting: the menu shows only one of two options that wake in the same minute.
+  const setting = presets.find((candidate) => snoozePresetId(candidate) === id);
+  const preset = setting === undefined ? null : resolveSnoozePreset(setting, now);
+  if (preset === null) {
+    const ids = resolveSnoozePresets(now, { presets })
+      .map((option) => option.id)
+      .join(", ");
+    return yield* new ThreadUsageError({
+      detail: `'${id}' is not a snooze option right now. ${ids === "" ? "Pass" : `Choose ${ids}, or pass`} --for or --until.`,
+    });
+  }
+  return preset.snoozedUntil;
+});
+
+const formatWakeTime = (snoozedUntil: string) =>
+  DateTime.formatLocal(DateTime.makeUnsafe(snoozedUntil), {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+
 const jsonFlag = Flag.Boolean("json").pipe(
   Flag.withDescription("Print JSON instead of text."),
   Flag.withDefault(false),
@@ -837,6 +914,10 @@ const threadListCommand = Command.make("list", {
     Flag.withDescription("Project id or a path inside the project. Defaults to this directory."),
     Flag.withDefault("."),
   ),
+  snoozed: Flag.Boolean("snoozed").pipe(
+    Flag.withDescription("List only snoozed threads, with when each one wakes."),
+    Flag.withDefault(false),
+  ),
   json: jsonFlag,
 }).pipe(
   Command.withDescription("List a project's threads, newest first."),
@@ -850,7 +931,13 @@ const threadListCommand = Command.make("list", {
         while (cursor !== null) {
           const page: OrchestratorMcpThreadListResult = yield* tools.call(
             "t3_thread_list",
-            { projectId: project.id, includeSubagents: false, limit: 100, cursor },
+            {
+              projectId: project.id,
+              includeSubagents: false,
+              ...(flags.snoozed ? { snoozed: true } : {}),
+              limit: 100,
+              cursor,
+            },
             OrchestratorMcpThreadListResult,
           );
           threads.push(...page.threads);
@@ -858,6 +945,17 @@ const threadListCommand = Command.make("list", {
         }
         if (flags.json) {
           return yield* printJson(threads);
+        }
+        if (flags.snoozed) {
+          const rows = threads.map((thread) => ({
+            thread,
+            wake: thread.snoozedUntil === null ? "" : formatWakeTime(thread.snoozedUntil),
+          }));
+          const wakeWidth = Math.max(0, ...rows.map(({ wake }) => wake.length));
+          for (const { thread, wake } of rows) {
+            yield* Console.log(`${thread.threadId}  ${wake.padEnd(wakeWidth)}  ${thread.title}`);
+          }
+          return;
         }
         for (const thread of threads) {
           yield* Console.log(`${thread.threadId}  ${thread.status.padEnd(11)}  ${thread.title}`);
@@ -1055,12 +1153,104 @@ const threadShowCommand = Command.make("show", {
   ),
 );
 
+const threadSnoozeCommand = Command.make("snooze", {
+  ...projectLocationFlags,
+  thread: threadArgument,
+  option: Argument.String("option").pipe(
+    Argument.withDescription(
+      "Snooze option id, such as at:tomorrow:09:00. Without it, --for, or --until, lists the options.",
+    ),
+    Argument.optional,
+  ),
+  for: Flag.String("for").pipe(
+    Flag.withDescription("Snooze for a custom duration, such as 90m, 2h, or 1.5d."),
+    Flag.optional,
+  ),
+  until: Flag.String("until").pipe(
+    Flag.withDescription("Snooze until a custom local date and time, as YYYY-MM-DD HH:MM."),
+    Flag.optional,
+  ),
+  json: jsonFlag,
+}).pipe(
+  Command.withDescription(
+    "Snooze a thread until one of the app's snooze options or a custom time.",
+  ),
+  Command.withHandler((flags) =>
+    Effect.gen(function* () {
+      const threadId = yield* decodeThreadId(flags.thread);
+      const chosen = [flags.option, flags.for, flags.until].filter(Option.isSome).length;
+      if (chosen > 1) {
+        return yield* new ThreadUsageError({
+          detail: "Pass one of a snooze option, --for, or --until.",
+        });
+      }
+      yield* withThreadTools(
+        flags,
+        Effect.fn("cli.thread.snooze")(function* (tools) {
+          const settings = yield* ServerSettings.ServerSettingsService;
+          const { snoozePresets } = yield* settings.getSettings;
+          const now = DateTime.toDate(yield* DateTime.now);
+          if (chosen === 0) {
+            const options = resolveSnoozePresets(now, { presets: snoozePresets });
+            if (flags.json) return yield* printJson(options);
+            const idWidth = Math.max(0, ...options.map((option) => option.id.length));
+            const labelWidth = Math.max(0, ...options.map((option) => option.label.length));
+            for (const option of options) {
+              yield* Console.log(
+                `${option.id.padEnd(idWidth)}  ${option.label.padEnd(labelWidth)}  ${option.whenLabel}`,
+              );
+            }
+            return;
+          }
+          const snoozedUntil = yield* snoozeWakeTime(flags, snoozePresets, now);
+          yield* tools.call(
+            "t3_thread_organize",
+            { threadId, action: "snooze", snoozedUntil },
+            OrchestrationV2DispatchCommandResult,
+          );
+          yield* flags.json
+            ? printJson({ threadId, snoozedUntil })
+            : Console.log(`Snoozed until ${formatWakeTime(snoozedUntil)}.`);
+        }),
+      );
+    }).pipe(reportThreadErrors),
+  ),
+);
+
+const threadUnsnoozeCommand = Command.make("unsnooze", {
+  ...projectLocationFlags,
+  thread: threadArgument,
+  json: jsonFlag,
+}).pipe(
+  Command.withDescription("Wake a snoozed thread now."),
+  Command.withHandler((flags) =>
+    Effect.gen(function* () {
+      const threadId = yield* decodeThreadId(flags.thread);
+      yield* withThreadTools(
+        flags,
+        Effect.fn("cli.thread.unsnooze")(function* (tools) {
+          yield* tools.call(
+            "t3_thread_organize",
+            { threadId, action: "unsnooze" },
+            OrchestrationV2DispatchCommandResult,
+          );
+          yield* flags.json
+            ? printJson({ threadId, snoozedUntil: null })
+            : Console.log("Unsnoozed.");
+        }),
+      );
+    }).pipe(reportThreadErrors),
+  ),
+);
+
 export const threadCommand = Command.make("thread").pipe(
-  Command.withDescription("Start, message, and read threads on the running server."),
+  Command.withDescription("Start, message, read, and snooze threads on the running server."),
   Command.withSubcommands([
     threadListCommand,
     threadStartCommand,
     threadSendCommand,
     threadShowCommand,
+    threadSnoozeCommand,
+    threadUnsnoozeCommand,
   ]),
 );
